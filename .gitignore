@@ -17,3 +17,6 @@ local.properties
 
 # Kotlin daemon logs
 .kotlin/
+
+# 安全钩子运行时状态（非源码）
+.mimosa/

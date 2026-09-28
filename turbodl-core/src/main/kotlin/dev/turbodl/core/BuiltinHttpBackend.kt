@@ -18,6 +18,19 @@ import java.io.File
  */
 internal class BuiltinHttpBackend(
     private val downloader: SegmentDownloader,
+    /**
+     * 配置观察者：每次 [download] 开始时把 `BackendContext.config` 交给它。
+     *
+     * 【为什么需要这个钩子】本类作为**插件后端**注册时（`TurboBackends.builtinHttp`），
+     * 它持有的 OkHttpClient 是在插件安装那一刻按当时的 config 构建的，此后
+     * `TurboClient.updateConfig()` **只重建 core 自己那两个 client**——而走插件路由时
+     * core 那个 downloader 根本不被使用。结果：改了代理 / DoH / 忽略SSL / 超时
+     * **不重启进程就不生效**（设置页却写着"动态生效"）。
+     *
+     * 这里把"最新 config"喂给客户端持有器，由它按传输层签名决定是否重建。
+     * 默认 null = 不关心（core 独立使用时的行为不变）。
+     */
+    private val onConfigSeen: ((TurboConfig) -> Unit)? = null,
 ) : DownloadBackend {
 
     override val name: String = "builtin-http"
@@ -28,6 +41,8 @@ internal class BuiltinHttpBackend(
     }
 
     override suspend fun download(context: BackendContext): BackendResult {
+        // 先让客户端持有器看到最新配置：传输层设置（代理/DNS/TLS/超时）变了就在此重建。
+        onConfigSeen?.invoke(context.config)
         val request = context.request
         val chunkDir = context.workDir
         val speedLimiter = SpeedLimiter { context.config.globalSpeedLimitBytesPerSec }
@@ -100,9 +115,28 @@ internal class BuiltinHttpBackend(
             val now = probe.validator
             val prev = runCatching { if (marker.isFile) marker.readText().trim() else "" }.getOrDefault("")
 
-            val changed = prev.isNotEmpty() && prev != now
+            // 【⛔ 真实事故，2026-09-28】这里曾把「探测失败」误判成「内容已变」并删光分片：
+            //
+            //   夸克直链失效（超 3 小时）→ 探测拿不到 totalSize/etag/lastModified
+            //   → `now = "weak"`（残缺令牌）
+            //   → 旧值 `prev = "len=1447815647|weak"` 与之不等
+            //   → `changed = true` → **删掉用户已下的 32 个分片 / 14.75MB**
+            //
+            // 判据错在把两个不同的量当成一回事：
+            //   · "服务器确实换了文件"（确证）—— 该删；
+            //   · "探测没拿到信息"（**无法取证**）—— 绝不能删，否则就是拿失败当证据。
+            //
+            // 因此 `changed` 现在**要求 `now` 本身是完整可用的令牌**：
+            // 至少要含 `len=` 或 `etag=`/`lm=` 之一；只有 `weak` 或空串一律不算"变了"。
+            val nowUsable = now.contains("len=") || now.contains("etag=") || now.contains("lm=")
+            val changed = prev.isNotEmpty() && prev != now && nowUsable
             val weakButResuming = probe.isWeak && !context.config.trustWeakValidator
             val hasOldParts = hasResumableParts
+
+            // 探测失败（令牌残缺）时：保留旧分片，但**不假装能续传** ——
+            // 让本次下载以可读原因失败（大概率是链接过期），用户重新解析链接即可继续。
+            // 数据留着，比"删干净从头下"对用户友好得多。
+            val probeDegraded = prev.isNotEmpty() && !nowUsable
 
             // 内容指纹：仅在「弱校验器 + 有旧分片 + 令牌本身没变」时才需要（其余分支已定性）。
             // 【三值判定，关键】把"取不到指纹"与"内容确实不同"**分开**：
@@ -111,7 +145,7 @@ internal class BuiltinHttpBackend(
             //   UNVERIFIABLE → 取不到（状态码异常/请求失败/无可读分片）→ **保留**
             // 旧写法把后两者混为一谈，于是"一次指纹请求没成功"就丢掉用户已下载的 GB 级数据 ——
             // 用户实报的"暂停还是从头下"极可能就是这一支。
-            val decision = if (weakButResuming && hasOldParts && !changed) {
+            val decision = if (weakButResuming && hasOldParts && !changed && !probeDegraded) {
                 verifyResumeFingerprint(chunkDir, effectiveUrl, request.headers)
             } else {
                 ResumeDecision.NOT_ATTEMPTED
@@ -127,11 +161,19 @@ internal class BuiltinHttpBackend(
                 chunkDir.mkdirs()
             }
             resumeNote = "parts=$hasOldParts weak=$weakButResuming changed=$changed " +
-                "print=$decision discard=$discard"
+                "print=$decision discard=$discard" +
+                if (probeDegraded) " probeDegraded=true(探测失效,已保留旧分片)" else ""
 
-            // 时序：validator 必须先于任何分片写入落盘。now 为空时删除旧文件，不留残留。
+            // 时序：validator 必须先于任何分片写入落盘。
+            // 【不能覆盖成残缺值】probeDegraded 时 `now="weak"` 之类是**没有信息**，
+            // 用它盖掉 `len=1447815647|weak` 会把"文件多大"这个已知事实也丢掉 ——
+            // 下次探测再失败就又变成 changed。故此时**保留旧令牌不动**。
             runCatching {
-                if (now.isEmpty()) marker.delete() else marker.writeText(now)
+                when {
+                    probeDegraded -> Unit          // 保留旧令牌（现状更完整）
+                    now.isEmpty() -> marker.delete() // 探测明确「无校验器」：清掉残留，避免下次误比
+                    else -> marker.writeText(now)
+                }
             }
         }
 

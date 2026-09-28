@@ -29,6 +29,10 @@ java {
 
 tasks.test {
     useJUnitPlatform()
+    // 诊断测量台会开 128~384 条并发连接，默认 512m 堆会 OOM；
+    // 而 OOM 不会让测试失败得干净利落——它会让某一档吞吐**静默偏低**，直接污染结论
+    // （实测：384 连接档 OOM 后，2/3 任务档的数值全部失真）。
+    maxHeapSize = "2g"
     testLogging {
         events("passed", "failed", "skipped")
         showStandardStreams = true

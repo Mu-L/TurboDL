@@ -47,7 +47,11 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
     fun updateConfig(newConfig: TurboConfig) {
         this.config = newConfig
         segmentClient = HttpClientFactory.build(newConfig, HttpClientFactory.ProtocolPreference.H1_ONLY)
-        streamClient = HttpClientFactory.build(newConfig, HttpClientFactory.ProtocolPreference.ALLOW_H2)
+        // 只重建已创建过的 h2 客户端：未创建说明从未走过整文件回退，
+        // 保持"未创建"状态即可，别为了更新配置把它提前唤醒（白付一次 build）。
+        if (streamClientRef != null) {
+            streamClientRef = HttpClientFactory.build(newConfig, HttpClientFactory.ProtocolPreference.ALLOW_H2)
+        }
     }
 
     // 双客户端：分片并发用 H1_ONLY（避免 h2 多路复用抹平多连接）；
@@ -55,14 +59,36 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
     // FORCE_HTTP1/FORCE_HTTP2 策略下两个客户端实际协议相同（均由 effectiveHttpVersionPolicy 决定）。
     @Volatile
     private var segmentClient = HttpClientFactory.build(config, HttpClientFactory.ProtocolPreference.H1_ONLY)
-    @Volatile
-    private var streamClient = HttpClientFactory.build(config, HttpClientFactory.ProtocolPreference.ALLOW_H2)
 
-    // 分片下载器用 H1 客户端；整文件/探测下载器用允许 h2 的客户端。
+    /**
+     * h2 客户端**惰性创建**。
+     *
+     * 【为什么不等价于急切构建】它只在整文件回退（[SegmentDownloader.downloadWhole]）时被用到，
+     * 而分片下载这条主路径 100% 走 [segmentClient]。急切构建等于给每个 TurboClient 白付一次
+     * OkHttpClient 构建成本（Dispatcher + ConnectionPool + 拦截器链 + 相关类首次加载），
+     * 实测本地回环下"启动→首字节"里就有这部分开销；而绝大多数任务永远用不到它。
+     *
+     * 用 @Volatile 引用而非 `by lazy`：既保持惰性，又允许 [updateConfig] 重建与
+     * [shutdown] 判断"是否创建过"（`by lazy` 无法安全地探测初始化状态）。
+     */
+    @Volatile
+    private var streamClientRef: okhttp3.OkHttpClient? = null
+
+    /** 取 h2 客户端，未创建则创建（双重检查：正常路径无锁，仅首次建时有竞争）。 */
+    private fun streamClientOrCreate(): okhttp3.OkHttpClient {
+        streamClientRef?.let { return it }
+        synchronized(this) {
+            streamClientRef?.let { return it }
+            return HttpClientFactory.build(config, HttpClientFactory.ProtocolPreference.ALLOW_H2)
+                .also { streamClientRef = it }
+        }
+    }
+
+    // 分片下载器用 H1 客户端；整文件/探测下载器用允许 h2 的客户端（后者惰性创建）。
     // 缓冲区大小从配置读取（默认 1MB）：过小会在高吞吐时产生大量 read/回调开销。
     private val downloader = SegmentDownloader(
         { segmentClient },
-        { streamClient },
+        { streamClientOrCreate() },
         { config.ioBufferSize },
     )
     private val speedLimiter = SpeedLimiter { config.globalSpeedLimitBytesPerSec }
@@ -195,8 +221,11 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
     /** 关闭引擎，取消所有任务并释放资源。 */
     fun shutdown() {
         scope.coroutineContext[Job]?.cancel()
-        streamClient.dispatcher.executorService.shutdown()
-        streamClient.connectionPool.evictAll()
+        // 惰性客户端可能从未创建：没创建过就没什么可关的，别在这里把它唤醒。
+        streamClientRef?.let { sc ->
+            sc.dispatcher.executorService.shutdown()
+            sc.connectionPool.evictAll()
+        }
         segmentClient.dispatcher.executorService.shutdown()
         segmentClient.connectionPool.evictAll()
     }

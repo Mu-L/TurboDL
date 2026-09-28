@@ -65,6 +65,9 @@ class KotlinPluginLoaderPlugin : Plugin {
  * http(s) tasks to it; when absent (and no other backend matches), TurboClient still uses its
  * own internal built-in backend, so downloads keep working.
  *
+ * 传输层设置（代理/DNS/TLS/超时）**跟随最新配置热更新**：见 [TurboBackends.builtinHttp]。
+ * 否则本插件会把它注册那一刻的 config 固化下来，导致宿主改了设置必须重启进程才生效。
+ *
  * @param priority routing priority; a higher-priority plugin backend overrides this one.
  */
 class HttpBackendPlugin(
