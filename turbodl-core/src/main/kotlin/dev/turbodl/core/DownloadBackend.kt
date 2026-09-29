@@ -41,10 +41,19 @@ interface DownloadBackend {
  * Result of a backend download: an ordered list of files to be concatenated into the
  * final destination, plus the authoritative total size (-1 if unknown).
  * A single-file result (e.g. whole-file fallback) is simply a one-element list.
+ *
+ * [partOffsets] 可选：每个分片在最终文件中的**起始偏移**（与 [orderedParts] 一一对应）。
+ *
+ * 【为什么需要它】收尾托管会让在飞分片提前收工，其文件长度可能**超过**让出点，
+ * 与接手的分片产生**重叠**。按顺序拼接会把重叠部分算两次（长度校验失败）；
+ * 而按显式偏移写入是幂等的 —— 重叠区间会被写到同一位置，内容一致，结果仍正确。
+ *
+ * 为 null 时退回"顺序拼接"语义（第三方 backend 无需感知本字段）。
  */
 class BackendResult(
     val orderedParts: List<File>,
     val totalBytes: Long,
+    val partOffsets: List<Long>? = null,
 )
 
 /**

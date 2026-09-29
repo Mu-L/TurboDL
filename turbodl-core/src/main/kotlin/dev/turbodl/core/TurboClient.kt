@@ -321,28 +321,40 @@ class TurboClient(config: TurboConfig = TurboConfig()) {
         // a plugin backend when the optional runtime installs a resolver).
         val backend = backendFor(request)
         val result = backend.download(context)
-        finish(id, request, result.orderedParts, result.totalBytes)
+        finish(id, request, result.orderedParts, result.totalBytes, result.partOffsets)
     }
 
-    private suspend fun finish(id: Long, request: DownloadRequest, parts: List<File>, total: Long) {
+    private suspend fun finish(
+        id: Long,
+        request: DownloadRequest,
+        parts: List<File>,
+        total: Long,
+        offsets: List<Long>? = null,
+    ) {
         updateProgress(id) { it.copy(state = TaskState.MERGING) }
-        for (p in parts) {
-            if (!p.exists() || p.length() <= 0) throw IllegalStateException("分片缺失/为空：$p")
-        }
         val dest = request.destination
-        dest.parentFile?.mkdirs()
-        // 合并时上报进度：GB 级文件拼接可能耗时数十秒，UI 不再卡在 MERGING 无进度。
-        var lastReport = 0L
-        val ok = PartMerger.merge(parts, dest) { mergedBytes, totalBytes ->
-            val now = System.currentTimeMillis()
-            if (now - lastReport >= 200) {
-                lastReport = now
-                updateProgress(id) {
-                    it.copy(state = TaskState.MERGING, downloadedBytes = mergedBytes, totalBytes = totalBytes)
-                }
+        // 【预先合并命中】后端已把完整数据写进目标文件（overlap merge），
+        // parts 就是目标文件本身 —— 此时**不能再合并一次**（那是把文件拷到自己身上）。
+        // 只做大小校验即可。
+        val alreadyMerged = parts.size == 1 && parts[0].canonicalFile == dest.canonicalFile
+        if (!alreadyMerged) {
+            for (p in parts) {
+                if (!p.exists() || p.length() <= 0) throw IllegalStateException("分片缺失/为空：$p")
             }
+            dest.parentFile?.mkdirs()
+            // 合并时上报进度：GB 级文件拼接可能耗时数十秒，UI 不再卡在 MERGING 无进度。
+            var lastReport = 0L
+            val ok = PartMerger.merge(parts, dest, onProgress = { mergedBytes, totalBytes ->
+                val now = System.currentTimeMillis()
+                if (now - lastReport >= 200) {
+                    lastReport = now
+                    updateProgress(id) {
+                        it.copy(state = TaskState.MERGING, downloadedBytes = mergedBytes, totalBytes = totalBytes)
+                    }
+                }
+            }, offsets = offsets)
+            if (!ok) throw IllegalStateException("合并分片失败")
         }
-        if (!ok) throw IllegalStateException("合并分片失败")
         if (total > 0 && dest.length() != total) {
             throw IllegalStateException("大小校验失败：期望 $total，实际 ${dest.length()}")
         }

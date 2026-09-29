@@ -32,6 +32,17 @@ internal enum class SegmentResult {
 
     /** 遇到 429 / 503：服务器过载信号 → 上层可下调并发。 */
     THROTTLED,
+
+    /**
+     * 授权/时效类失败（401 / 403 / 410）：**不是**"你太快了"的信号。
+     *
+     * 【为什么必须与 [FAILED] 分开】403 常见于签名直链过期或被反盗链拦截 ——
+     * 此时正确响应是**重新解析地址后重试**，而不是降低并发。
+     * 若与普通失败混在一起，会触发背压降并发，把速度白白压下去却解决不了 403
+     * （aria2-next 对此有明确说明："HTTP 403 does not estimate server capacity"）。
+     * 上层据此走"遗忘终址 + 重试"路径，且**不计入**背压的连续失败计数。
+     */
+    AUTH_EXPIRED,
 }
 
 /**
@@ -199,6 +210,22 @@ internal class SegmentDownloader(
                 lastModified?.takeIf { it.isNotBlank() }?.let { "lm=$it" },
                 "weak".takeIf { isWeak },
             ).joinToString("|")
+
+        /**
+         * 用于 `If-Range` 的**强**校验器；没有则返回 null。
+         *
+         * 规则（RFC 9110 §13.1.5）：
+         *  - `If-Range` **只接受强校验器**。弱 ETag（`W/"..."`）会被服务器忽略，
+         *    发了等于没发，还会让人误以为有保护 → 显式排除。
+         *  - 强 ETag 优先；没有强 ETag 时才退回 Last-Modified
+         *    （HTTP 日期精度到秒，且 CDN 可能改写，属较弱的保护，但聊胜于无）。
+         */
+        val strongIfRange: String?
+            get() {
+                val e = etag?.takeIf { it.isNotBlank() }
+                if (e != null && !e.startsWith("W/", ignoreCase = true)) return e
+                return lastModified?.takeIf { it.isNotBlank() }
+            }
 
         /**
          * 是否为**弱校验器**：只拿到大小，没有 ETag / Last-Modified。
@@ -447,9 +474,45 @@ internal class SegmentDownloader(
         // 分片下载不再内部 withContext(Dispatchers.IO)：调度器已由调用方（SegmentScheduler）
         // 用 limitedParallelism 开好专用的阻塞 IO 池。若这里再切回共享的 Dispatchers.IO，
         // 会直接抵消专用池的作用，并重新受 max(64, cpus) 默认并行度限制。
+    ): SegmentResult = downloadSegment(taskId, url, start, { end }, partFile, headers, onBytes)
+
+    /**
+     * 同上，但区间末端由 [endProvider] 现读 —— 用于**收尾托管**：
+     * 分片在下载途中可能被"让出后半段"，此处每次检查都能拿到最新区间，
+     * 从而在到达新末端时提前收工（不把已让出的部分也下下来）。
+     *
+     * 注意 HTTP 请求头里的 `Range` 仍按**首次读取**的值发送：这是刻意的 ——
+     * 若托管发生在请求已发出之后，本次仍会读完原区间，此时：
+     *  - 原分片写入到 `min(实际末端, 现区间末端)` 就停（见 writeSlice 的 limit）；
+     *  - 让出去的部分由新分片重新请求，内容一致（同一文件的同一区间），
+     *    重复下载少量字节换来"零等待"，且不会产生错误数据。
+     */
+    suspend fun downloadSegment(
+        taskId: Long,
+        url: String,
+        start: Long,
+        endProvider: () -> Long,
+        partFile: File,
+        headers: Map<String, String>,
+        onBytes: suspend (Long) -> Unit,
+        /**
+         * `If-Range` 校验器（可选）：有强 ETag 时优先用它，否则用 Last-Modified。
+         *
+         * 【为什么必须带】分片下载是**多个请求拼一个文件**。若中途 CDN 换了内容
+         * （网盘重新上传、源站更新），后续分片会取到新版本的字节，
+         * 与已下的旧版本字节拼在一起 —— 得到一个**新旧混杂**的文件，
+         * 而长度校验仍会通过（大小常常一致）。带 If-Range 后服务器会
+         * 在内容不匹配时返回 200（整文件）而非 206，上层据此走 RANGE_IGNORED 重试，
+         * 不会写入错误数据。
+         *
+         * 注意 If-Range 只接受**强校验器**（`W/` 开头的弱 ETag 会被忽略），
+         * 故调用方需按 [strongIfRange] 的规则挑选。
+         */
+        ifRange: String? = null,
     ): SegmentResult {
+        var end = endProvider()
         val existing = partFile.length()
-        val expected = end - start + 1
+        var expected = end - start + 1
         if (existing >= expected) return SegmentResult.OK
         val from = start + existing
 
@@ -458,6 +521,7 @@ internal class SegmentDownloader(
         val req = Request.Builder()
             .url(target)
             .header("Range", "bytes=$from-$end")
+            .apply { if (!ifRange.isNullOrBlank()) header("If-Range", ifRange) }
             .apply { headers.forEach { (k, v) -> header(k, v) } }
             // identity 在自定义头之后，确保不被覆盖：避免 gzip 透明解压破坏分片字节计数。
             .header("Accept-Encoding", "identity")
@@ -490,7 +554,15 @@ internal class SegmentDownloader(
                             return@use SegmentResult.RANGE_IGNORED
                         }
                         val body = resp.body ?: return@use SegmentResult.FAILED
-                        val written = writeSlice(body.byteStream(), partFile, existing, expected - existing, onBytes)
+                        // 收尾托管可能在请求发出后缩短了区间：以**当前**末端为准，
+                        // 多读到的字节直接丢弃（见 writeSlice 的 limit 参数），
+                        // 让出去的部分由新分片重新取，内容一致。
+                        end = endProvider()
+                        expected = end - start + 1
+                        if (existing >= expected) return@use SegmentResult.OK
+                        val written = writeSlice(
+                            body.byteStream(), partFile, existing, expected - existing, onBytes,
+                        )
                         if (existing + written != expected) SegmentResult.FAILED else SegmentResult.OK
                     }
                     200 -> {
@@ -509,8 +581,17 @@ internal class SegmentDownloader(
                     else -> {
                         // 401/403/410 是「授权/时效」类信号：记住的 CDN 直链很可能已过期，
                         // 遗忘它 → 下次重新走原始 URL 解析（自愈），而不是一直撞同一个失效地址。
-                        if (code == 401 || code == 403 || code == 410) forgetResolvedUrl(taskId)
-                        if (code in 500..599) SegmentResult.THROTTLED else SegmentResult.FAILED
+                        //
+                        // 单独归为 AUTH_EXPIRED（而非 FAILED）：403 **不是**"并发太高"的信号，
+                        // 若混进普通失败会触发背压降并发 —— 既解决不了 403，又白掉速度。
+                        if (code == 401 || code == 403 || code == 410) {
+                            forgetResolvedUrl(taskId)
+                            SegmentResult.AUTH_EXPIRED
+                        } else if (code in 500..599) {
+                            SegmentResult.THROTTLED
+                        } else {
+                            SegmentResult.FAILED
+                        }
                     }
                 }
             }

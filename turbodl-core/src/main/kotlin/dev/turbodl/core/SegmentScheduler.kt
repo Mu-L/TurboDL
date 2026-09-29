@@ -44,24 +44,53 @@ internal class SegmentScheduler(
     private val downloader: SegmentDownloader,
     private val config: TurboConfig,
     private val speedLimiter: SpeedLimiter,
-) {    private companion object {
-        /** 背压恢复阈值：累计成功这么多个分片后，尝试归还并发名额。 */
-        const val RAMP_UP_SUCCESS_THRESHOLD = 2
-
+    ) {    private companion object {
         /**
          * 每次上调的比例（相对当前目标并发）。
          *
          * 旧实现每次只 +1，从慢启动初始值 4 爬到 128 需要 124 次上调、约 248 个成功分片——
          * 慢网或中小文件根本爬不到设定值，用户会看到「线程数始终远低于设定」。
-         * 改为按比例上调（至少 +1），几十个分片内即可到顶，同时仍是渐进的、不冲击服务器。
+         *
+         * 【2026-09-29 实测调整 0.5 → 1.0】0.5 时从 4 到 16 需要 4 档（4→6→9→13→16），
+         * 每档要等一个分片完成。改为 1.0（即翻倍）后只需 2 档（4→8→16），
+         * 配合阈值=1，爬满时间从「约 8 个分片」降到「约 2 个分片」。
+         *
+         * 仍然保留分档（而非一上来全开）：服务器在档与档之间仍有观察窗口，
+         * 真限流会被 `throttleDown` 捕获并压回；只是不再让用户白等几秒。
          */
-        const val RAMP_UP_FACTOR = 0.5
+        const val RAMP_UP_FACTOR = 1.0
+
+        /**
+         * 爬升检查间隔（毫秒）。
+         *
+         * 【为什么用时间而不是"每 N 个成功分片"】分片时长 = 块大小 / 单连接速率，
+         * 于是**按成功次数爬升会被块大小放大**：8MB 块 + 8MB/s 单连接 = 每档要等 1 秒。
+         * 实测（512MB/16连接/每连接 8MB/s）：按次数爬升网络段 6.01s，直接全开 4.21s，
+         * 理论下限 4.00s —— 慢启动白吃 1.8s，且**文件越大、连接越慢，白吃越多**，
+         * 恰好是最需要并发来提速的场景爬得最慢。
+         *
+         * 改为每 [RAMP_INTERVAL_MS] 检查一次：窗口内有成功、且没被限流 → 上调一档。
+         * 爬满时间从此与分片大小无关，只与窗口数有关（16 连接约 2 档 ≈ 0.5s）。
+         *
+         * 安全性不变：真限流会走 [throttleDown]（乘性减半）并收紧 [ceiling]，
+         * 爬升再快也会被压回来；窗口内出现过限流就不上调。
+         */
+        const val RAMP_INTERVAL_MS = 250L
 
         /** 被 park 的协程轮询间隔（毫秒）。 */
         const val PARK_POLL_MS = 80L
 
         /** 队列暂空但仍有在飞分片时的等待间隔（毫秒）。 */
         const val DRAIN_WAIT_MS = 30L
+
+        /**
+         * 收尾托管的切分对齐粒度（字节）。
+         *
+         * 对齐到 64KB（而不是任意字节）的理由：避免产生怪异的 Range 边界
+         * （某些 CDN 对非对齐的 Range 响应较慢或直接拒绝），
+         * 也便于观察/复现。aria2-next 同样用 `64_k` 作为拆分量子下限。
+         */
+        const val TAIL_ALIGN = 64L * 1024
 
         /**
          * 单分片遇到「服务器返回整文件（忽略 Range）」的全局容忍次数。
@@ -88,32 +117,6 @@ internal class SegmentScheduler(
          * 取大于 ramp-up 阈值一个量级：试探本身会撞墙（一次 503），必须罕见。
          */
         const val CEILING_PROBE_AFTER = 16
-
-        /**
-         * 总切块数的上限（防「连接数 × segmentsPerConnection」无上限膨胀）。
-         *
-         * 【为什么需要】块数 = `连接数 × spc`（默认 spc=4）是个**没有上限的乘法**：
-         * 128 连接 → 512 块（被 minSegmentSize 压到 256 块，每块仅 64KB）。
-         * 每个块 = 一次 HTTP 请求 + 一个临时文件 + 最后合并时的一次读写。
-         *
-         * 【实测（`FanoutCostTest`，16MB 不限速回环，3 次取中位数）】把"连接数"和"分片数"分离后：
-         *
-         * | 组 | 连接 | 分片 | 吞吐 |
-         * |---|---|---|---|
-         * | A 基线 | 128 | 256 | **4.4 MB/s** |
-         * | B 同连接、分片减半 | 128 | 128 | **10.5** |
-         * | C 同分片、连接减半 | 64 | 128 | 11.0 |
-         * | D 同分片、连接再减半 | 32 | 128 | 9.7 |
-         *
-         * **连接数 128→32 几乎无影响，而分片数减半带来 2.4 倍** → 主因是分片数（请求/合并开销），
-         * 不是连接数。
-         *
-         * 【取值 128 的理由】① 对 `连接数 ≤ 32` 的配置**完全不生效**（32×4=128，默认 16 更不受影响），
-         * 所以默认体验零变化；② 128 块仍保有工作窃取所需的粒度；
-         * ③ 只做"止血"，不去调优「均速要少块 / 偏斜要多块」这个由 `SkewSweepTest` 证明的自适应问题
-         * ——那需要真实链路数据，不在本版范围。
-         */
-        const val MAX_TARGET_SEGMENTS = 128
     }
 
     sealed interface Outcome {
@@ -122,10 +125,18 @@ internal class SegmentScheduler(
         data class Failed(val reason: String) : Outcome
     }
 
-    /** 固定区间分片（预分块，区间不可变——避免运行时缩短导致的重叠/膨胀）。 */
+    /**
+     * 分片。区间**默认不变**，但收尾托管（[TurboConfig.tailAssist]）可在运行时
+     * 缩短 [end] —— 这是「空闲连接接管慢分片剩余部分」的实现基础。
+     *
+     * 【为什么可以安全缩短】拆分 = [A,B] 缩短为 [A,M] + 新分片 [M+1,B]。
+     * 原分片文件始终是 A 起的**连续前缀**，长度 M-A+1；续传时
+     * `existing = length()`、`from = start + existing = M+1` → 写入位置正确。
+     * 文件名的 end 部分在下载结束后按最终区间重命名，保证 [verifyCoverage] 能正确解析。
+     */
     private class Segment(
         val start: Long,
-        val end: Long,
+        end: Long,
         var attempts: Int = 0,
         /**
          * **限流（429/503）单独的计数**，不与 [attempts] 混用。
@@ -135,9 +146,26 @@ internal class SegmentScheduler(
          * 旧实现混用，导致一个在并发降下来之前被拒几次的分片就被丢掉 → 整个任务失败。
          */
         var throttleAttempts: Int = 0,
+        /** 已被托管的次数（防病态裂变，上限 [TurboConfig.maxSplitsPerSegment]）。 */
+        var splits: Int = 0,
     ) {
+        private val endRef = java.util.concurrent.atomic.AtomicLong(end)
+        /** 当前区间末端（可被收尾托管原子缩短）。 */
+        var end: Long
+            get() = endRef.get()
+            set(v) { endRef.set(v) }
+
         val length get() = end - start + 1
-        fun file(dir: File) = File(dir, "seg_${start}_${end}.part")
+
+        /**
+         * 分片文件。文件名里的 end 是**计划区间**，不随托管缩短而改 ——
+         * 因为托管发生时文件可能正被写入，Windows 下无法重命名打开中的文件。
+         * 实际覆盖范围以**文件长度**为准（见 [finalParts] / [verifyCoverage]）。
+         */
+        fun file(dir: File) = File(dir, "seg_${start}_$plannedEnd.part")
+
+        /** 计划末端（构造时确定，永不变）。 */
+        val plannedEnd: Long = endRef.get()
     }
 
     suspend fun run(
@@ -147,10 +175,24 @@ internal class SegmentScheduler(
         chunkDir: File,
         headers: Map<String, String>,
         connections: Int,
-        resumeFrom: Long,
         onBytes: suspend (delta: Long, absolute: Long) -> Unit,
         onConnections: (Int) -> Unit,
         isActive: () -> Boolean,
+        /**
+         * `If-Range` 校验器（可选）：分片是多个请求拼一个文件，
+         * 若中途源站换了内容，新旧字节会混在一起且长度校验仍通过。
+         * 带上它可让服务器在内容已变时返回整文件（200），由上层重试而非写入错数据。
+         */
+        ifRange: String? = null,
+        /**
+         * 分片完成回调（可选）：用于**下载中预先合并** —— 把已完成分片
+         * 立刻写进目标文件的临时副本，使合并 I/O 与网络等待重叠。
+         *
+         * 参数为 (分片起始偏移, 分片文件)。实现方需容忍**乱序与重复**调用：
+         * 分片可能乱序完成，收尾托管也可能产生区间重叠。
+         * 回调抛异常不得影响下载 —— 调用点已包 runCatching。
+         */
+        onSegmentDone: (suspend (start: Long, file: File) -> Unit)? = null,
     ): Outcome = coroutineScope {
         chunkDir.mkdirs()
         // per-host 并发上限：默认 0 = 不限（只有个别 CDN 如迅雷才需要限，且应由调用方按 host 选择性启用）。
@@ -217,8 +259,17 @@ internal class SegmentScheduler(
         val failReason = AtomicReference<String?>(null)
         val rangeIgnoredCount = AtomicInteger(0)
         val consecutiveFailures = AtomicInteger(0)
-        /** 累计成功分片数（用于背压恢复判断）。 */
+        /**
+         * 窗口内的成功计数（用于时间驱动的爬升判断）。
+         *
+         * 注意它不是"连续"计数：由 [rampLoop] 每 250ms 清零一次，
+         * 因此语义是「这 250ms 里有没有成功过」——
+         * 这正是时间驱动爬升需要的信号（旧的按次计数会被分片时长放大）。
+         */
         val consecutiveSuccesses = AtomicInteger(0)
+
+        /** 本窗口内是否出现过限流（429/503）。有则不爬升，把窗口让给背压生效。 */
+        val windowThrottled = java.util.concurrent.atomic.AtomicBoolean(false)
 
         // ---------- 并发闸门：workers 个协程按 idx 与 desired 自闸门 ----------
         /** 动态目标并发（可因背压下调、因持续成功恢复；上限 workers）。 */
@@ -254,12 +305,83 @@ internal class SegmentScheduler(
         val activeConns = AtomicInteger(0)
         /** 正在传输中的分片数（判定“队列空但仍可能有重试回投”）。 */
         val inFlight = AtomicInteger(0)
+
+        /**
+         * 当前在飞分片（供收尾托管挑选"剩余最多"的那一个）。
+         *
+         * 只在收尾阶段被读，写入点也少（领取/归还），用并发集合即可，无需锁。
+         */
+        val inFlightSegments: MutableSet<Segment> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+        /** 收尾托管已生效次数（用于日志与调参；也在测试里做行为断言）。 */
+        val tailAssistCount = AtomicInteger(0)
+
+        /** 本任务实际写入完成的分片数（用于收尾判定：块数少到不够分时才有托管价值）。 */
         onConnections(slowStartInit)
 
         fun poll(): Segment? = synchronized(pendingLock) { pending.poll() }
         fun offer(seg: Segment) = synchronized(pendingLock) { pending.offer(seg) }
         fun queueEmpty(): Boolean = synchronized(pendingLock) { pending.isEmpty() }
         fun queueSize(): Int = synchronized(pendingLock) { pending.size }
+
+        /**
+         * 收尾托管：把一个在飞分片的**后半段**让给新连接，自己保留前半段。
+         *
+         * 思路来自 aria2-next 的 `CurlSession::rebalanceEndgame`
+         * （`src/stream/StreamScheduling.cc`），但触发条件更严格。
+         *
+         * 【触发条件】调用方必须已确认「队列空 && 有空闲 worker」——
+         * 即大块传输阶段**完全不触发**，只在收尾、并发自然塌下去的窗口里生效。
+         * 这样新增的请求数只发生在"反正也要等"的时间里，不增加对服务器的冲击面。
+         *
+         * 【挑谁拆】剩余字节最多的那个；且剩余量必须 >= 2×[TurboConfig.tailAssistMinBytes]
+         * （拆完两半都不低于下限，避免"拆出一个更小的尾巴"）。
+         *
+         * 【拆多少】在剩余区间的**中点**切，并对齐到 64KB（避免怪异的 Range 边界）。
+         * aria2-next 用"剩余时间 vs 请求成本"来估算量子，这里简化为固定对齐 ——
+         * 我们没有逐连接的实时速率，而且固定对齐已足够避免碎片。
+         *
+         * @return 是否发生了托管
+         */
+        fun tryTailAssist(): Boolean {
+            if (!config.tailAssist) return false
+            if (inFlightSegments.isEmpty()) return false
+            // 候选：剩余最多、且足够大、且未超拆分次数
+            var best: Segment? = null
+            var bestRemaining = 0L
+            val minBytes = config.tailAssistMinBytes
+            for (s in inFlightSegments) {
+                if (s.splits >= config.maxSplitsPerSegment) continue
+                // 已下多少 = 文件当前长度（下载中持续增长）
+                val done = runCatching { s.file(chunkDir).length() }.getOrDefault(0L)
+                val remaining = (s.end - s.start + 1) - done
+                val from = s.start + done
+                if (remaining < 2 * minBytes) continue
+                if (remaining > bestRemaining) {
+                    bestRemaining = remaining
+                    best = s
+                }
+            }
+            val seg = best ?: return false
+
+            // 在剩余区间的中点切，对齐 64KB
+            val done = runCatching { seg.file(chunkDir).length() }.getOrDefault(0L)
+            val from = seg.start + done
+            val keep = ((bestRemaining / 2) / TAIL_ALIGN) * TAIL_ALIGN
+            if (keep < minBytes) return false
+            val cutAt = from + keep - 1          // 原分片保留 [start, cutAt]
+            val tailStart = cutAt + 1            // 新分片接手 [tailStart, end]
+            if (tailStart > seg.end) return false
+
+            val oldEnd = seg.end
+            // 先原子缩短原分片：下载循环会在下一次检查时停止写入超过 cutAt 的数据
+            seg.end = cutAt
+            seg.splits++
+            val tail = Segment(tailStart, oldEnd)
+            offer(tail)
+            tailAssistCount.incrementAndGet()
+            return true
+        }
 
         /**
          * 上报给 UI 的并发数。
@@ -343,11 +465,15 @@ internal class SegmentScheduler(
          * 旧实现只降不升，一次瞬时 429/503 就永久把并发减半（可逐步降到 1），
          * 网络恢复后再也跑不满——这正是「下到后面线程数掉下去、速度只剩几 KB」的主因。
          * 现在只要持续成功就一步步把 desired 加回 workers，被 park 的协程随即复活。
+         *
+         * 【2026-09-29 改为时间驱动】原实现挂在「每个分片成功」上，于是爬升速度
+         * 被**分片时长**绑架：分片越大/单连接越慢，每档等得越久，而大文件正是最需要
+         * 尽快跑满并发的场景。现由 [rampLoop] 每 [RAMP_INTERVAL_MS] 调用一次：
+         * 窗口内有成功且未限流 → 上调一档。爬满时间与分片大小解耦。
          */
         fun rampUpIfHealthy() {
             if (desired.get() >= workers) return
-            if (consecutiveSuccesses.get() < RAMP_UP_SUCCESS_THRESHOLD) return
-            consecutiveSuccesses.set(0)
+            if (windowThrottled.get()) return                 // 窗口内被限流过：先稳住
             val cur = desired.get()
             val cap = ceiling.get()
             if (cur >= cap) {
@@ -359,12 +485,42 @@ internal class SegmentScheduler(
                 }
                 return
             }
-            // 按比例上调（至少 +1）：从 4 爬到 128 只需十余次，而非 124 次。
+            // 按比例上调（至少 +1）：log2 档数即可到顶。
             val step = max(1, (cur * RAMP_UP_FACTOR).toInt())
             val next = min(min(workers, cap), cur + step)
             desired.set(next)
             reportConns()
         }
+
+        /**
+         * 时间驱动的爬升循环：每 [RAMP_INTERVAL_MS] 尝试上调一档。
+         *
+         * 与 [rampUpIfHealthy] 的分工：本循环只负责"到点触发"，
+         * 是否真的上调由 rampUpIfHealthy 依据窗口内的成功/限流情况决定。
+         *
+         * 【为什么时间与"分片完成"两个触发都要】二者各覆盖一半场景：
+         *  - **分片完成触发**（见 OK 分支）：小块+多块时（8MB 文件切成 512 块、
+         *    每块 3ms）完成事件密集，几百毫秒内就能爬满 —— 只靠时间触发反而太慢，
+         *    `RampUpReportingTest` 的 128 连接用例就是这么失败的。
+         *  - **时间触发**（本循环）：大块+慢连接时（8MB 块 @ 8MB/s = 每块 1 秒）
+         *    完成事件稀疏，只靠完成触发要 8 秒才爬满 —— 这正是实测中
+         *    网络段被拖到 6.01s（理论 4.00s）的原因。
+         *
+         * 两者取先到者：小块场景由完成事件驱动，大块场景由时间兜底，
+         * 爬升时间从此不再被分片时长绑架。
+         */
+        val rampLoop = if (config.slowStart) launch(ioDispatcher) {
+            var lastBytes = downloaded.get()
+            while (isActive() && !needWholeFallback.get()) {
+                delay(RAMP_INTERVAL_MS)
+                val cur = downloaded.get()
+                val progressed = cur > lastBytes
+                lastBytes = cur
+                if (!progressed) continue        // 本窗口没进展：不涨，也不清限流标记
+                rampUpIfHealthy()
+                windowThrottled.set(false)
+            }
+        } else null
 
         val ok = try {
             val jobs = List(workers) { idx ->
@@ -379,23 +535,33 @@ internal class SegmentScheduler(
                         }
                         val seg = poll()
                         if (seg == null) {
-                            // 队列暂空：若仍有分片在传（可能因失败/限流被回投），等一下再领，不立即退出。
-                            if (inFlight.get() > 0) { delay(DRAIN_WAIT_MS); continue }
+                            // 队列空：先尝试收尾托管（把在飞分片的后半段让给本 worker）。
+                            // 只在"没有新块可领"时发生 —— 大块传输阶段队列非空，不受影响。
+                            if (inFlight.get() > 0) {
+                                if (tryTailAssist()) {
+                                    // 托管成功：新分片已入队，立刻回头领取
+                                    continue
+                                }
+                                delay(DRAIN_WAIT_MS); continue
+                            }
                             break  // 真正无活可干：退出
                         }
                         if (needWholeFallback.get() || !isActive()) { offer(seg); break }
                         inFlight.incrementAndGet()
                         activeConns.incrementAndGet()
+                        inFlightSegments.add(seg)
                         reportConns()
                         try {
                             val res = downloader.downloadSegment(
-                                taskId, url, seg.start, seg.end, seg.file(chunkDir), headers
-                            ) { bytes ->
-                                speedLimiter.awaitAllow(bytes)
-                                val abs = min(downloaded.addAndGet(bytes), total)
-                                if (!isActive()) return@downloadSegment
-                                onBytes(bytes, abs)
-                            }
+                                taskId, url, seg.start, { seg.end }, seg.file(chunkDir), headers,
+                                { bytes ->
+                                    speedLimiter.awaitAllow(bytes)
+                                    val abs = min(downloaded.addAndGet(bytes), total)
+                                    if (!isActive()) return@downloadSegment
+                                    onBytes(bytes, abs)
+                                },
+                                ifRange = ifRange,
+                            )
                             when (res) {
                                 SegmentResult.OK -> {
                                     // 【S4 修复】不再"每次成功都清零"。
@@ -405,8 +571,16 @@ internal class SegmentScheduler(
                                     // 改为**衰减**：每次成功只减 1，让间歇失败能累积到阈值，
                                     // 同时持续健康时又能自然回落到 0。
                                     consecutiveFailures.updateAndGet { if (it > 0) it - 1 else 0 }
+                                    // 【双触发之一：分片完成】小块场景（块数多、每块耗时短）
+                                    // 依赖它快速爬升；大块场景由 rampLoop 的时间节拍兜底。
+                                    // 详见 rampLoop 的注释。
                                     consecutiveSuccesses.incrementAndGet()
                                     rampUpIfHealthy()
+                                    // 下载中预先合并：把刚完成的区间写进目标文件的临时副本。
+                                    // 失败不影响下载本身（runCatching 吞掉，收尾仍走常规合并）。
+                                    onSegmentDone?.let { cb ->
+                                        runCatching { cb(seg.start, seg.file(chunkDir)) }
+                                    }
                                 }
                                 SegmentResult.RANGE_IGNORED -> {
                                     // 单分片被返回整文件：容忍偶发，反复出现才判定服务器不支持 Range。
@@ -415,7 +589,31 @@ internal class SegmentScheduler(
                                         needWholeFallback.compareAndSet(false, true)
                                     }
                                 }
+                                SegmentResult.AUTH_EXPIRED -> {
+                                    // 【不降并发】401/403/410 = 授权/时效信号（签名直链过期、
+                                    // 反盗链拦截），**不是**"你太快了"。降并发既解决不了它，
+                                    // 还会白白拖慢后续重试。
+                                    // 正确响应：立即回投重试（下层已遗忘失效终址，
+                                    // 下次会重新走原始 URL 解析 → 拿到新签名）。
+                                    consecutiveSuccesses.set(0)
+                                    seg.attempts++
+                                    if (seg.attempts > config.maxRetries) {
+                                        failReason.compareAndSet(
+                                            null,
+                                            "分片 ${seg.start}-${seg.end} 授权/时效失败（401/403/410）" +
+                                                "重试 ${seg.attempts} 次仍失败",
+                                        )
+                                    } else {
+                                        // 短暂退避即可：主要成本在"重新解析地址"，
+                                        // 不在等待；退避太长反而拖延新签名的获取。
+                                        delay(backoffMsFor((seg.attempts - 1).coerceAtMost(2)))
+                                        offer(seg)
+                                    }
+                                }
                                 SegmentResult.THROTTLED -> {
+                                    // 标记本窗口被限流：rampLoop 会跳过这次爬升，
+                                    // 把 250ms 留给背压（throttleDown）生效。
+                                    windowThrottled.set(true)
                                     consecutiveSuccesses.set(0)
                                     val n = consecutiveFailures.incrementAndGet()
                                     // 【关键修复】429/503 **不占用** maxRetries 预算，用独立且更宽松的预算。
@@ -475,6 +673,7 @@ internal class SegmentScheduler(
                         } finally {
                             activeConns.decrementAndGet()
                             inFlight.decrementAndGet()
+                            inFlightSegments.remove(seg)
                             reportConns()
                         }
                     }
@@ -486,6 +685,9 @@ internal class SegmentScheduler(
             throw e
         } finally {
             watchdog?.cancel()
+            // 必须显式取消：rampLoop 是 launch 的子协程，会阻止 coroutineScope 退出，
+            // 若不取消则任务完成后仍空转到超时（实测收尾段被拖到 14s）。
+            rampLoop?.cancel()
         }
 
         // 卡死重试耗尽：明确失败（分片已保留，用户重试即续传）
@@ -500,14 +702,26 @@ internal class SegmentScheduler(
         Outcome.Completed
     }
 
-    /** 校验 [0,total) 被完整块连续覆盖。 */
+    /**
+     * 校验 [0,total) 被分片文件**实际覆盖**。
+     *
+     * 【为什么用文件长度而不是文件名里的区间】收尾托管会把在飞分片缩短
+     * （[Segment.end] 运行时可变），但**文件名里的末端是计划值、不会跟着改**
+     * （托管发生时文件可能正被写入，Windows 下无法重命名打开中的文件）。
+     * 因此判断"这个分片覆盖了哪一段"只能依据它**实际有多少字节**：
+     * 起点取自文件名（start 永不变），终点 = start + 实际长度 - 1。
+     *
+     * 这对未发生托管的常规下载**完全等价**（长度 == 计划长度），
+     * 只是把"信任文件名"换成了"信任磁盘上的真实字节"——后者才是事实。
+     */
     private fun verifyCoverage(dir: File, total: Long): Pair<Boolean, List<LongRange>> {
         val blocks = dir.listFiles { f -> f.name.startsWith("seg_") && f.name.endsWith(".part") }
             ?.mapNotNull { f ->
                 val name = f.name.removePrefix("seg_").removeSuffix(".part")
                 val s = name.substringBefore('_').toLongOrNull() ?: return@mapNotNull null
-                val e = name.substringAfter('_').toLongOrNull() ?: return@mapNotNull null
-                if (f.length() >= (e - s + 1)) s..e else null
+                val len = f.length()
+                if (len <= 0) return@mapNotNull null
+                s..(s + len - 1)
             }?.sortedBy { it.first } ?: emptyList()
         val missing = mutableListOf<LongRange>()
         var pos = 0L
@@ -519,9 +733,38 @@ internal class SegmentScheduler(
         return (missing.isEmpty() && pos >= total) to missing
     }
 
-    /** 合并所有分片（按 start 排序）。 */
+    /**
+     * 合并用的分片列表（按起点排序）。
+     *
+     * 【不再去重，改由调用方按"显式偏移"写入】
+     * 收尾托管会让在飞分片提前收工，其文件长度可能超过让出点，与接手的分片
+     * **重叠**（例如 `seg_A_B.part` 写到 M，而 `seg_M+1_B.part` 也下了 M+1..B）。
+     * 按顺序拼接会把重叠算两次 → 长度校验失败。
+     *
+     * 解决办法不是"猜哪些该丢"，而是**按各自真实起点写入**（见 [partStarts]）：
+     * 重叠区间会落到同一位置、写同样的内容 → 幂等，结果天然正确。
+     * 起点就来自文件名（start 永不变），无需任何启发式判断。
+     */
     fun finalParts(chunkDir: File): List<File> =
+        sortedSegFiles(chunkDir).map { it.first }
+
+    /**
+     * 各分片在最终文件中的起始偏移（与 [finalParts] 一一对应）。
+     *
+     * 起点直接取自文件名 —— 这就是它在源文件中的绝对位置，**精确且无需推导**。
+     */
+    fun partStarts(chunkDir: File): List<Long> =
+        sortedSegFiles(chunkDir).map { it.second }
+
+    /** 返回 (文件, 起始偏移)，按起始偏移升序；忽略空文件。 */
+    private fun sortedSegFiles(chunkDir: File): List<Pair<File, Long>> =
         chunkDir.listFiles { f -> f.name.startsWith("seg_") && f.name.endsWith(".part") }
-            ?.sortedBy { it.name.removePrefix("seg_").substringBefore('_').toLongOrNull() ?: 0L }
+            ?.mapNotNull { f ->
+                val s = f.name.removePrefix("seg_").substringBefore('_').toLongOrNull()
+                    ?: return@mapNotNull null
+                if (f.length() <= 0) return@mapNotNull null
+                f to s
+            }
+            ?.sortedBy { it.second }
             ?: emptyList()
 }

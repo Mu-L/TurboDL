@@ -260,6 +260,19 @@ internal class BuiltinHttpBackend(
         val scheduler = SegmentScheduler(downloader, context.config, speedLimiter)
         // 真实并发数由调度器回报（而非直接用配置值），UI 才能看到实际跑满多少线程。
         val liveConnsRef = java.util.concurrent.atomic.AtomicInteger(connections)
+        // 【下载中预先合并】把已完成分片立刻写进目标文件的临时副本，
+        // 让合并 I/O 与网络等待重叠（详见 OverlapMerger 的注释）。
+        // 仅在"要写多分片"的场景有意义；关闭时不产生任何额外 I/O。
+        val ov = if (context.config.overlapMerge && total > 0) {
+            OverlapMerger(context.request.destination).apply {
+                reset()
+                expectedSize = total      // 一次性预分配，写入只 seek 不改长度
+            }
+        } else null
+        // 显式声明为 suspend 函数类型：直接写 `(suspend (Long, File) -> Unit)?` 在
+        // 局部变量位置会触发 Kotlin 的类型推断问题，故用具名 lambda + 显式类型标注。
+        val onSegDone: suspend (Long, File) -> Unit = { start, file -> ov?.onSegmentDone(start, file) }
+
         val outcome = scheduler.run(
             taskId = context.taskId,
             url = effectiveUrl,
@@ -267,15 +280,45 @@ internal class BuiltinHttpBackend(
             chunkDir = chunkDir,
             headers = request.headers,
             connections = connections,
-            resumeFrom = 0L,
             onBytes = { _, abs -> context.reportProgress(abs, liveConnsRef.get()) },
             onConnections = { live -> liveConnsRef.set(live) },
             isActive = { context.isActive() },
+            onSegmentDone = onSegDone,
+            ifRange = probe.strongIfRange,
         )
 
         return when (outcome) {
-            is SegmentScheduler.Outcome.Completed ->
-                BackendResult(scheduler.finalParts(chunkDir), total)
+            is SegmentScheduler.Outcome.Completed -> {
+                // 【预先合并命中】若临时副本已完整，直接发布它，省掉收尾那次全量合并。
+                //
+                // 注意：**不能**用 `mergedBytes >= total` 作为前置条件来短路 publish()——
+                // 写线程是异步的，下载结束时队列里通常还有大量分片没写完
+                // （实测 enqueued=251 / dequeued=62）。那样会导致 publish() 从不被调用、
+                // 数据永远不全，预合并形同虚设。
+                // 正确做法：总是让 publish() 去等队列排空，由它自己判定完整性；
+                // 并把全部分片交给它，用于补齐写线程可能还差的一两个尾部块。
+                val published = if (ov != null && total > 0) {
+                    val allParts = scheduler.finalParts(chunkDir).associateBy { f ->
+                        f.name.removePrefix("seg_").substringBefore('_').toLongOrNull() ?: -1L
+                    }
+                    ov.publish(total, allParts)
+                } else false
+                if (System.getenv("TURBODL_DEBUG_OVERLAP") == "1") {
+                    System.err.println(
+                        "[overlap] enabled=${ov != null} mergedBytes=${ov?.mergedBytes()} total=$total " +
+                            "failed=${ov?.hasFailed()} published=$published " +
+                            "tempExists=${ov?.tempFile?.isFile} tempLen=${ov?.tempFile?.length()} " +
+                            "stats=${ov?.debugStats()}"
+                    )
+                }
+                if (published) {
+                    BackendResult(listOf(context.request.destination), total)
+                } else {
+                    runCatching { ov?.shutdown() }
+                    runCatching { ov?.tempFile?.delete() }
+                    BackendResult(scheduler.finalParts(chunkDir), total, scheduler.partStarts(chunkDir))
+                }
+            }
 
             is SegmentScheduler.Outcome.NeedWholeFallback -> {
                 // Range 反复被忽略才会走到这里（单次偶发已在调度器重试层容忍）。
@@ -296,13 +339,13 @@ internal class BuiltinHttpBackend(
                     val retry = scheduler.run(
                         taskId = context.taskId, url = effectiveUrl, total = total,
                         chunkDir = chunkDir, headers = request.headers, connections = connections,
-                        resumeFrom = 0L,
-                        onBytes = { _, abs -> context.reportProgress(abs, liveConnsRef.get()) },
+                                    onBytes = { _, abs -> context.reportProgress(abs, liveConnsRef.get()) },
                         onConnections = { live -> liveConnsRef.set(live) },
                         isActive = { context.isActive() },
+                        ifRange = probe.strongIfRange,
                     )
                     if (retry is SegmentScheduler.Outcome.Completed) {
-                        return BackendResult(scheduler.finalParts(chunkDir), total)
+                        return BackendResult(scheduler.finalParts(chunkDir), total, scheduler.partStarts(chunkDir))
                     }
                     // 仍不行：清空重新整文件下（兼容真不支持 Range 的服务器）。
                 }

@@ -62,6 +62,23 @@ private class Options {
     var json = false
     var quiet = false
     var progressIntervalMs = 400L
+    // ---------- 调优旋钮（基准测试用：无需重新编译即可扫参数）----------
+    /** 每连接预分块数。越大越能吸收慢连接，但分片切换开销也越大。 */
+    var segmentsPerConnection: Int? = null
+    /** 单块硬上限（字节）。 */
+    var blockSize: Long? = null
+    /** 分片软下限（字节）。 */
+    var minSegmentSize: Long? = null
+    /** 慢启动起始并发（0 = 自动）。 */
+    var slowStartInitial: Int? = null
+    /** 关闭收尾托管（用于 A/B 对照）。 */
+    var noTailAssist = false
+    /** 关闭下载中预先合并（用于 A/B 对照）。 */
+    var noOverlap = false
+    /** 单连接停滞多久后中断该连接（毫秒，0=关闭）。 */
+    var stallTimeoutMs: Long? = null
+    /** 输出阶段耗时事件（启动段诊断用）。 */
+    var timing = false
 }
 
 fun main(args: Array<String>) {
@@ -115,12 +132,23 @@ fun main(args: Array<String>) {
             "--force-http1" -> opts.httpPolicy = HttpVersionPolicy.FORCE_HTTP1
             "--no-warmup" -> opts.warmUp = false
             "--no-slow-start" -> opts.slowStart = false
+            "--spc" -> opts.segmentsPerConnection = take().toIntOrNull()?.coerceIn(1, 64)
+                ?: usageError("--spc 需为 1..64 的整数")
+            "--block-size" -> opts.blockSize = parseSize(take())
+            "--min-segment" -> opts.minSegmentSize = parseSize(take())
+            "--slow-start-initial" -> opts.slowStartInitial = take().toIntOrNull()?.coerceAtLeast(1)
+                ?: usageError("--slow-start-initial 需为 >=1 的整数")
+            "--no-tail-assist" -> opts.noTailAssist = true
+            "--no-overlap" -> opts.noOverlap = true
+            "--stall-timeout" -> opts.stallTimeoutMs = take().toLongOrNull()?.coerceAtLeast(0)
+                ?: usageError("--stall-timeout 需为毫秒数")
             "--insecure" -> opts.insecure = true
             "--connect-timeout" -> opts.connectTimeoutMs = take().toLongOrNull()?.coerceAtLeast(1000)
                 ?: usageError("--connect-timeout 需为毫秒数")
             "--read-timeout", "--timeout" -> opts.readTimeoutMs = take().toLongOrNull()?.coerceAtLeast(1000)
                 ?: usageError("--timeout 需为毫秒数")
             "--json" -> opts.json = true
+            "--timing" -> { opts.json = true; opts.timing = true }
             "-q", "--quiet" -> opts.quiet = true
             "--progress-interval" -> opts.progressIntervalMs = take().toLongOrNull()?.coerceAtLeast(100)
                 ?: usageError("--progress-interval 需为毫秒数")
@@ -217,6 +245,14 @@ private fun downloadOne(task: Task, opts: Options): Boolean = runBlocking {
             trustAllCerts = opts.insecure,
             connectTimeoutMs = opts.connectTimeoutMs,
             readTimeoutMs = opts.readTimeoutMs,
+            // 调优旋钮：仅在显式给出时覆盖默认值
+            segmentsPerConnection = opts.segmentsPerConnection ?: TurboConfig().segmentsPerConnection,
+            blockSize = opts.blockSize ?: TurboConfig().blockSize,
+            minSegmentSize = opts.minSegmentSize ?: TurboConfig().minSegmentSize,
+            slowStartInitial = opts.slowStartInitial ?: TurboConfig().slowStartInitial,
+            tailAssist = !opts.noTailAssist,
+            overlapMerge = !opts.noOverlap,
+            stallTimeoutMs = opts.stallTimeoutMs ?: TurboConfig().stallTimeoutMs,
         )
     )
     // 中断时立即释放，分片保留供下次续传
@@ -226,6 +262,32 @@ private fun downloadOne(task: Task, opts: Options): Boolean = runBlocking {
     opts.userAgent?.let { headers.putIfAbsent("User-Agent", it) }
 
     downloading.set(true)
+
+    // 【启动段诊断】把引擎自报的阶段耗时打到 stdout，供基准脚本归因（`--timing` 开启）。
+    // 只读事件、不改行为；与下面的进度轮询并行运行。
+    if (opts.timing) {
+        val tStart = System.currentTimeMillis()
+        Thread {
+            kotlinx.coroutines.runBlocking {
+                runCatching {
+                    client.events.collect { ev ->
+                        when (ev) {
+                            is dev.turbodl.core.TurboEvent.Metadata -> println(
+                                """{"type":"timing","stage":"metadata",""" +
+                                    """"t_ms":${System.currentTimeMillis() - tStart},""" +
+                                    """"probe_ms":${ev.probeMs},"resume":"${jsonEsc(ev.resumeNote ?: "")}"}"""
+                            )
+                            is dev.turbodl.core.TurboEvent.StateChanged -> println(
+                                """{"type":"timing","stage":"state","state":"${ev.state}",""" +
+                                    """"t_ms":${System.currentTimeMillis() - tStart}}"""
+                            )
+                            else -> Unit
+                        }
+                    }
+                }
+            }
+        }.apply { isDaemon = true }.start()
+    }
 
     val id = client.submit(
         DownloadRequest(
