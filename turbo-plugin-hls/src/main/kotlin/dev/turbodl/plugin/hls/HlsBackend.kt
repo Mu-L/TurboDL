@@ -57,7 +57,14 @@ class HlsBackend : DownloadBackend {
     }.getOrDefault(false)
 
     override suspend fun download(context: BackendContext): BackendResult = coroutineScope {
-        val client = TurboHttpClients.create(context.config)
+        // 【禁用自动重定向】改由本插件逐跳校验（见 HlsRequestPolicy.redirectTarget）：
+        // OkHttp 的自动跟随会直接跳到 Location，我们无从检查目标是否 HTTPS、
+        // 也不会重新按"新来源"过滤敏感头 —— 一次 302 到明文 http 或第三方域，
+        // 就会把凭证发出去，且后续下载全程都在那个地址上进行。
+        val client = TurboHttpClients.create(context.config).newBuilder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
         try {
             val playlist = resolvePlaylist(client, context)
             // Playlist manifests do not reliably expose a final byte total. Progress starts with
@@ -202,10 +209,13 @@ class HlsBackend : DownloadBackend {
             FileOutputStream(output, false).use { file ->
                 body.byteStream().use { input ->
                     val buffer = ByteArray(BUFFER_SIZE)
+                    var written = 0L
                     while (true) {
                         ensureBackendActive(context)
                         val read = input.read(buffer)
                         if (read <= 0) break
+                        // 单分片字节上限：分片是远端可控内容，无上限时一个异常响应能把磁盘写满。
+                        written = HlsIo.checkedTotal(written, read.toLong())
                         file.write(buffer, 0, read)
                         onBytes(read.toLong())
                     }
@@ -256,14 +266,11 @@ class HlsBackend : DownloadBackend {
     }
 
     private fun requestBuilder(uri: URI, original: DownloadRequest): Request.Builder =
-        Request.Builder().url(uri.toString()).apply {
-            original.headers.forEach { (name, value) -> header(name, value) }
-            // Consistent default identity with core, while allowing a caller-provided UA override.
-            if (original.headers.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
-                header("User-Agent", "TurboDL/0.1")
-            }
-            get()
-        }
+        HlsRequestPolicy.newRequestBuilder(
+            targetUrl = uri.toString(),
+            originUrl = original.url,
+            headers = original.headers,
+        )
 
     private suspend fun <T> execute(
         client: OkHttpClient,
@@ -272,15 +279,58 @@ class HlsBackend : DownloadBackend {
         block: suspend (okhttp3.Response) -> T,
     ): T = withContext(Dispatchers.IO) {
         currentCoroutineContext().ensureActive()
-        val call = client.newCall(request)
-        val handle = currentCoroutineContext()[Job]?.invokeOnCompletion { call.cancel() }
-        activeConnections?.incrementAndGet()
-        try {
-            call.execute().use { response -> block(response) }
-        } finally {
-            activeConnections?.decrementAndGet()
-            handle?.dispose()
+        // 【手动逐跳跟随重定向】客户端的自动跟随已关闭（见 download() 的说明），
+        // 这里逐跳校验：每跳都要求 HTTPS，并按**新地址**重新计算敏感头
+        // （跨域则不携带 Cookie/Authorization/Referer）。
+        var current = request
+        var hops = 0
+        while (true) {
+            val call = client.newCall(current)
+            val handle = currentCoroutineContext()[Job]?.invokeOnCompletion { call.cancel() }
+            activeConnections?.incrementAndGet()
+            val redirect: okhttp3.HttpUrl?
+            try {
+                call.execute().use { response ->
+                    if (response.isRedirect) {
+                        val here = response.request.url
+                        redirect = HlsRequestPolicy.redirectTarget(
+                            response.header("Location"), here,
+                        )
+                        if (redirect == null) {
+                            throw IllegalStateException(
+                                "HLS redirect not followed: target is not a valid HTTPS URL",
+                            )
+                        }
+                    } else {
+                        return@withContext block(response)
+                    }
+                }
+            } finally {
+                activeConnections?.decrementAndGet()
+                handle?.dispose()
+            }
+            hops++
+            if (hops > MAX_REDIRECTS) {
+                throw IllegalStateException("HLS request exceeded $MAX_REDIRECTS redirects")
+            }
+            val target = redirect ?: throw IllegalStateException("HLS redirect without target")
+            current = HlsRequestPolicy.newRequestBuilder(
+                targetUrl = target.toString(),
+                originUrl = request.url.toString(),
+                headers = headersOf(request),
+            ).build()
         }
+        @Suppress("UNREACHABLE_CODE")
+        throw IllegalStateException("unreachable")
+    }
+
+    /** 取回请求上已设置的头（供重定向时重新按来源过滤）。 */
+    private fun headersOf(request: Request): Map<String, String> {
+        val out = LinkedHashMap<String, String>()
+        for (i in 0 until request.headers.size) {
+            out[request.headers.name(i)] = request.headers.value(i)
+        }
+        return out
     }
 
     private fun decryptAes128(input: File, output: File, key: ByteArray, iv: ByteArray) {
@@ -303,5 +353,8 @@ class HlsBackend : DownloadBackend {
 
     private companion object {
         const val BUFFER_SIZE = 128 * 1024
+
+        /** 重定向上限：正常 HLS 最多 1~2 跳，超过即视为异常链路。 */
+        const val MAX_REDIRECTS = 5
     }
 }
