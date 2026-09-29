@@ -485,4 +485,41 @@ sealed interface DnsMode {
 
     /** DNS over HTTPS（例如 https://dns.google/dns-query）。 */
     data class DoH(val dohUrl: String) : DnsMode
+
+    /**
+     * 自动择优：并发探测多个公共 DoH，采用**最快给出有效结果**的那个，
+     * 并在后续一段时间内固定使用它；全部失败时回退系统 DNS。
+     *
+     * 【为什么需要它】用户此前只能在「系统 DNS」与「手动填一个 DoH」之间二选一：
+     *  - 系统 DNS：可能被污染/劫持，且运营商解析质量参差
+     *  - 手动 DoH：用户很难知道哪个 DoH 在当前网络下可用 ——
+     *    实测国内网络下境外 DoH（Cloudflare / Google）普遍很慢甚至不通，
+     *    而用户往往先填的就是这几个，结果"开了 DoH 反而更慢"
+     *
+     * 自动模式把"选哪个"交给实测：一次并发探测（最坏 4 秒）选出当前网络下最快的，
+     * 之后固定复用，避免每次解析都重新测速带来的抖动与额外流量。
+     *
+     * **不影响正常连接速度**：探测只发生在首次解析时（且结果缓存 5 分钟），
+     * 选定后与单端点 DoH 的路径完全一致。
+     *
+     * @param endpoints 候选端点；默认国内优先（阿里/腾讯），其后是境外（Google/Cloudflare）
+     */
+    data class Auto(
+        val endpoints: List<String> = DEFAULT_DOH_ENDPOINTS,
+    ) : DnsMode
+
+    companion object {
+        /**
+         * 默认候选 DoH 端点，**国内优先**。
+         *
+         * 顺序即探测顺序，但自动模式是**并发**探测取最快者，故顺序只影响极端情况下的兜底。
+         * 列入境外端点是为了覆盖"国内 DoH 均不可用"的网络环境。
+         */
+        val DEFAULT_DOH_ENDPOINTS = listOf(
+            "https://dns.alidns.com/dns-query",   // 阿里公共 DNS（国内）
+            "https://doh.pub/dns-query",          // 腾讯 DNSPod（国内）
+            "https://dns.google/dns-query",       // Google（境外，部分网络不可达）
+            "https://cloudflare-dns.com/dns-query", // Cloudflare（境外，部分网络不可达）
+        )
+    }
 }

@@ -105,4 +105,21 @@ internal class TransportClientHolder(initial: TurboConfig) {
  */
 object TurboHttpClients {
     fun create(config: TurboConfig): okhttp3.OkHttpClient = HttpClientFactory.build(config)
+
+    /**
+     * 探测各候选 DoH 端点的解析延迟（毫秒）；失败或超时记为 -1。
+     *
+     * 供宿主把「自动 DNS 选了哪个、各端点各多快」可视化给用户看。
+     * 探测是**并发**的，整体耗时约等于最快的那个端点（上限 [timeoutMs]）。
+     *
+     * @param endpoints 候选端点；默认取 [DnsMode.DEFAULT_DOH_ENDPOINTS]
+     * @param hostname 用于探测的域名（默认 `www.baidu.com` —— 国内可达性最好，
+     *   避免"探一个被墙的域名导致所有端点都显示失败"）
+     * @return 与 [endpoints] 顺序一致的 (端点, 延迟毫秒) 列表；-1 表示不可用
+     */
+    fun probeDohLatency(
+        endpoints: List<String> = DnsMode.DEFAULT_DOH_ENDPOINTS,
+        hostname: String = "www.baidu.com",
+        timeoutMs: Long = 4_000L,
+    ): List<Pair<String, Long>> = HttpClientFactory.probeDohLatency(endpoints, hostname, timeoutMs)
 }

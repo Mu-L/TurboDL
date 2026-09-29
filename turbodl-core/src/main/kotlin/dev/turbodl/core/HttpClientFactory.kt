@@ -148,6 +148,7 @@ internal object HttpClientFactory {
             is DnsMode.System -> builder.dns(FamilyOrderedDns(Dns.SYSTEM))
             is DnsMode.StaticHosts -> builder.dns(StaticHostsDns(mode.hosts))
             is DnsMode.DoH -> builder.dns(FamilyOrderedDns(DohDns(mode.dohUrl)))
+            is DnsMode.Auto -> builder.dns(FamilyOrderedDns(DohDns(mode.endpoints)))
         }
     }
 
@@ -175,9 +176,25 @@ internal object HttpClientFactory {
     /**
      * DNS over HTTPS（最小实现，RFC 8484 GET application/dns-message）。
      * 失败回退系统 DNS，保证可用性。
+     *
+     * 支持**单端点**与**自动择优**：
+     *  - [single]：固定使用用户指定的 DoH（行为与历史一致）
+     *  - [auto]：并发探测多个公共 DoH，固定采用**最快给出有效结果**的那个
+     *
+     * @param dohUrl 单端点模式下的 DoH 地址（自动模式下忽略）
+     * @param autoEndpoints 自动模式的候选端点；非空即启用自动择优
      */
-    private class DohDns(dohUrl: String) : Dns {
+    private class DohDns private constructor(
+        dohUrl: String?,
+        private val autoEndpoints: List<String>,
+    ) : Dns {
+        constructor(dohUrl: String) : this(dohUrl, emptyList())
+        constructor(endpoints: List<String>) : this(null, endpoints)
+
         private val base = dohUrl
+
+        /** 自动模式是否启用。 */
+        private val auto: Boolean get() = autoEndpoints.isNotEmpty()
         /**
          * DoH 客户端。
          *
@@ -210,7 +227,7 @@ internal object HttpClientFactory {
                 if (e.expireAt > now) return e.addrs
                 cache.remove(hostname, e)
             }
-            val result = runCatching { queryDoH(hostname) }
+            val result = runCatching { if (auto) lookupAuto(hostname) else queryDoH(base!!, hostname) }
                 .getOrNull()
                 ?.takeIf { it.isNotEmpty() }
                 ?: preferIpv4(Dns.SYSTEM.lookup(hostname))
@@ -218,11 +235,64 @@ internal object HttpClientFactory {
             return result
         }
 
-        private fun queryDoH(hostname: String): List<InetAddress> {
+        /**
+         * 自动择优：当前选中的端点。
+         *
+         * 选定后**固定复用**，直到它解析失败或超出有效期 —— 每次查询都重新测速会让
+         * 解析延迟抖动，也会显著增加探测流量（每查一个域名要多打几个 DoH）。
+         */
+        @Volatile
+        private var selectedEndpoint: String? = null
+
+        @Volatile
+        private var selectedAt: Long = 0L
+
+        /**
+         * 自动模式解析：优先用已选端点；失效则并发探测全部候选，采用最快给出有效结果的那个。
+         *
+         * 【为什么并发探测】串行时要等前一个超时（3s）才轮到下一个，4 个候选最坏白等 12 秒；
+         * 并发把最坏情况压到**一个超时周期**。
+         */
+        private fun lookupAuto(hostname: String): List<InetAddress> {
+            val current = selectedEndpoint
+            if (current != null && System.currentTimeMillis() - selectedAt < ENDPOINT_TTL_MS) {
+                val addrs = runCatching { queryDoH(current, hostname) }.getOrDefault(emptyList())
+                if (addrs.isNotEmpty()) return addrs
+                selectedEndpoint = null      // 选定的端点失效：重新择优
+            }
+            val pool = java.util.concurrent.Executors.newFixedThreadPool(autoEndpoints.size) { r ->
+                Thread(r, "turbodl-doh-probe").apply { isDaemon = true }
+            }
+            return try {
+                val futures = autoEndpoints.map { ep ->
+                    ep to pool.submit<List<InetAddress>> {
+                        runCatching { queryDoH(ep, hostname) }.getOrDefault(emptyList())
+                    }
+                }
+                val deadline = System.currentTimeMillis() + PROBE_DEADLINE_MS
+                val pending = futures.toMutableList()
+                while (pending.isNotEmpty() && System.currentTimeMillis() < deadline) {
+                    val done = pending.firstOrNull { it.second.isDone }
+                        ?: run { Thread.sleep(20); null } ?: continue
+                    pending.remove(done)
+                    val addrs = runCatching { done.second.get() }.getOrDefault(emptyList())
+                    if (addrs.isNotEmpty()) {
+                        selectedEndpoint = done.first
+                        selectedAt = System.currentTimeMillis()
+                        return addrs
+                    }
+                }
+                emptyList()
+            } finally {
+                pool.shutdownNow()
+            }
+        }
+
+        private fun queryDoH(endpoint: String, hostname: String): List<InetAddress> {
             val query = buildDnsQuery(hostname)
             val b64 = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(query)
-            val sep = if (base.contains('?')) "&" else "?"
-            val url = "$base${sep}dns=$b64"
+            val sep = if (endpoint.contains('?')) "&" else "?"
+            val url = "$endpoint${sep}dns=$b64"
             val req = Request.Builder()
                 .url(url)
                 .header("Accept", "application/dns-message")
@@ -236,7 +306,7 @@ internal object HttpClientFactory {
         }
 
         /** 构造最简 A 记录查询报文。 */
-        private fun buildDnsQuery(hostname: String): ByteArray {
+        internal fun buildDnsQuery(hostname: String): ByteArray {
             val out = java.io.ByteArrayOutputStream()
             val dos = java.io.DataOutputStream(out)
             dos.writeShort(0x0000)      // ID
@@ -257,7 +327,7 @@ internal object HttpClientFactory {
         }
 
         /** 解析 A 记录（IPv4）。仅提取 answer 中 type=A 的 4 字节地址。 */
-        private fun parseDnsAnswers(msg: ByteArray, hostname: String): List<InetAddress> {
+        internal fun parseDnsAnswers(msg: ByteArray, hostname: String): List<InetAddress> {
             val din = java.io.DataInputStream(java.io.ByteArrayInputStream(msg))
             din.skipBytes(4)                         // ID + flags
             val qd = din.readUnsignedShort()
@@ -285,13 +355,21 @@ internal object HttpClientFactory {
         }
 
         /** 跳过 DNS name（处理压缩指针）。 */
-        private fun skipName(din: java.io.DataInputStream) {
+        internal fun skipName(din: java.io.DataInputStream) {
             while (true) {
                 val len = din.readUnsignedByte()
                 if (len == 0) break
                 if (len and 0xC0 == 0xC0) { din.skipBytes(1); break }  // 压缩指针，2 字节
                 din.skipBytes(len)
             }
+        }
+
+        private companion object {
+            /** 选定端点的有效期：过期后重新择优（网络环境可能已变化）。 */
+            const val ENDPOINT_TTL_MS = 10 * 60 * 1000L
+
+            /** 并发探测的整体等待上限（略大于单次 3 秒超时）。 */
+            const val PROBE_DEADLINE_MS = 4_000L
         }
     }
 
@@ -308,6 +386,69 @@ internal object HttpClientFactory {
         builder.sslSocketFactory(ctx.socketFactory, trustAll[0] as X509TrustManager)
         builder.hostnameVerifier { _, _ -> true }
     }
+
+    /**
+     * 探测各 DoH 端点的解析延迟（毫秒）；不可用记 -1。
+     *
+     * 【为什么并发】串行探测 4 个端点、每个超时 3 秒 → 最坏要等 12 秒，
+     * 用户点开设置页会明显卡住。并发把整体耗时压到"最快端点的耗时"（上限 timeoutMs）。
+     *
+     * 【为什么默认探 baidu.com】若探一个在被墙域名，所有端点都会失败，
+     * 界面上会显示"全部不可用"——那是探测目标的问题，不是 DoH 的问题。
+     * 用国内可达性最好的域名，才能真实反映各端点在本机网络下的可用性与延迟。
+     */
+    internal fun probeDohLatency(
+        endpoints: List<String>,
+        hostname: String,
+        timeoutMs: Long,
+    ): List<Pair<String, Long>> {
+        if (endpoints.isEmpty()) return emptyList()
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(endpoints.size) { r ->
+            Thread(r, "turbodl-doh-latency").apply { isDaemon = true }
+        }
+        return try {
+            val client = OkHttpClient.Builder()
+                .connectTimeout(3, TimeUnit.SECONDS)
+                .readTimeout(3, TimeUnit.SECONDS)
+                .build()
+            // 复用 DohDns 的报文编解码，避免重复实现（两处不一致会导致"能查但不能探测"这类怪问题）
+            val codec = DohDns(endpoints.first())
+            val query = codec.buildDnsQuery(hostname)
+            val b64 = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(query)
+            val futures = endpoints.map { ep ->
+                pool.submit<Long> {
+                    val started = System.nanoTime()
+                    runCatching {
+                        val sep = if (ep.contains('?')) "&" else "?"
+                        val req = Request.Builder()
+                            .url("$ep${sep}dns=$b64")
+                            .header("Accept", "application/dns-message")
+                            .get()
+                            .build()
+                        client.newCall(req).execute().use { resp ->
+                            if (!resp.isSuccessful) return@submit -1L
+                            val bytes = resp.body?.bytes() ?: return@submit -1L
+                            // 必须真解析出地址才算可用：仅"HTTP 200"可能是一张错误页
+                            if (codec.parseDnsAnswers(bytes, hostname).isEmpty()) -1L
+                            else (System.nanoTime() - started) / 1_000_000
+                        }
+                    }.getOrDefault(-1L)
+                }
+            }
+            val deadline = System.currentTimeMillis() + timeoutMs
+            endpoints.indices.map { i ->
+                val remaining = (deadline - System.currentTimeMillis()).coerceAtLeast(0)
+                endpoints[i] to runCatching {
+                    futures[i].get(remaining, TimeUnit.MILLISECONDS)
+                }.getOrDefault(-1L)
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    // DNS 报文的构造与解析在 DohDns 内部实现，此处复用其逻辑需要可见性调整；
+    // 为避免重复实现，把它们提为文件级私有工具（下方）。
 }
 
 /**
