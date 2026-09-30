@@ -1,7 +1,9 @@
 package dev.turbodl.core
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
@@ -108,8 +110,16 @@ object TurboDiagnostics {
      * 代理/DNS/TLS 配置），否则配了代理的用户会探出与实测相反的结论。
      *  - 成功 → 返回 null，继续正常扫描；
      *  - 失败 → 返回可读原因（含 HTTP 状态码），调用方应**直接中止**并展示给用户。
+     *
+     * 【必须在 IO 线程上调用】内部是阻塞式 `call.execute()`。
+     * 曾因宿主在主线程直接调用而抛 `NetworkOnMainThreadException`，
+     * 且被 catch 成"链接不可用"的文本 —— 看起来像链接的问题，实则是调用方式的问题。
+     * 故此处**自己确保调度器**（见下 [checkReachable] / [checkReachableAsync]），
+     * 不依赖调用方传对上下文。
      */
     private fun probeAlive(url: String, headers: Map<String, String>): String? {
+        // 出站 host 校验：只允许 http/https，并拒绝环回/私有/保留地址。
+        outboundHostRejection(url)?.let { return it }
         val cfg = TurboConfig(maxConnectionsPerTask = 1, maxConcurrentTasks = 1, warmUpConnections = false, slowStart = false)
         val client = HttpClientFactory.build(cfg)
         return try {
@@ -138,9 +148,51 @@ object TurboDiagnostics {
         }
     }
 
-    /** [probeAlive] 的公开入口：宿主可先自己探活（例如在候选任务里挑一个还活着的）。 */
+    /**
+     * 出站地址预检：拒绝非 http(s) 与环回/私有/保留地址；通过则返回 null。
+     *
+     * 探测会真的建立连接，因此与其它出站请求适用同一条约束：
+     * 只允许公网 http/https，不允许把诊断当成访问本机/内网服务的工具。
+     */
+    private fun outboundHostRejection(url: String): String? {
+        val uri = runCatching { java.net.URI(url) }.getOrNull()
+            ?: return "地址格式不正确"
+        val scheme = uri.scheme?.lowercase()
+        if (scheme != "http" && scheme != "https") {
+            return "仅支持 http/https 链接（当前为 ${uri.scheme ?: "未知"}）"
+        }
+        val host = uri.host ?: return "地址缺少主机名"
+        val addrs = runCatching { java.net.InetAddress.getAllByName(host) }.getOrNull()
+            ?: return null   // 解析不了就交给真正的请求去暴露原因（可能是 DNS 问题）
+        for (a in addrs) {
+            if (a.isLoopbackAddress || a.isAnyLocalAddress || a.isLinkLocalAddress ||
+                a.isSiteLocalAddress || a.isMulticastAddress
+            ) {
+                return "拒绝访问本机/内网/保留地址（$host）"
+            }
+        }
+        return null
+    }
+
+    /**
+     * [probeAlive] 的公开同步入口（宿主自行保证不在主线程调用）。
+     *
+     * 仍保留同步形式：已有调用方在挂起函数内使用它，改签名会波及它们。
+     * 若你在 UI 层调用，请改用 [checkReachableAsync]。
+     */
     fun checkReachable(url: String, headers: Map<String, String> = emptyMap()): String? =
         probeAlive(url, headers)
+
+    /**
+     * [probeAlive] 的**挂起版**：内部切到 IO 调度器，可在任意协程上下文安全调用。
+     *
+     * 新增此入口是为了从根上消除 `NetworkOnMainThreadException` ——
+     * 让"在哪条线程调"不再是调用方需要操心的事。
+     */
+    suspend fun checkReachableAsync(url: String, headers: Map<String, String> = emptyMap()): String? =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            probeAlive(url, headers)
+        }
 
     /**
      * 扫描一组连接数，返回每档的吞吐。
@@ -160,7 +212,9 @@ object TurboDiagnostics {
         onTier: (suspend (ConnectionTierResult) -> Unit)? = null,
     ): List<ConnectionTierResult> = coroutineScope {
         // 前置探活：链接死了就立刻报，别让用户白等 4 个 15 秒窗口。
-        probeAlive(url, headers)?.let { reason ->
+        // 前置探活是阻塞调用，必须切到 IO —— 否则宿主在主线程调用时这里会抛
+        // NetworkOnMainThreadException，并被上层误显示成"链接不可用"。
+        withContext(Dispatchers.IO) { probeAlive(url, headers) }?.let { reason ->
             return@coroutineScope tiers.map { n ->
                 ConnectionTierResult(n, 0, 0, 0, "未开始：$reason").also { onTier?.invoke(it) }
             }
@@ -341,7 +395,9 @@ object TurboDiagnostics {
         onTier: (suspend (ConnectionTierResult) -> Unit)? = null,
     ): List<ConnectionTierResult> = coroutineScope {
         // 前置探活：链接死了就立刻报，别让用户白等 N 个 15 秒窗口（与连接数扫描同理）。
-        probeAlive(url, headers)?.let { reason ->
+        // 前置探活是阻塞调用，必须切到 IO —— 否则宿主在主线程调用时这里会抛
+        // NetworkOnMainThreadException，并被上层误显示成"链接不可用"。
+        withContext(Dispatchers.IO) { probeAlive(url, headers) }?.let { reason ->
             return@coroutineScope taskCounts.map { k ->
                 ConnectionTierResult(k, 0, 0, 0, "未开始：$reason").also { onTier?.invoke(it) }
             }

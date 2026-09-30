@@ -215,9 +215,17 @@ class TailAssistTest {
         val key = "ta4-fixed"
 
         val c1 = TurboClient(tailConfig(work, assist = true))
-        c1.submit(DownloadRequest("http://127.0.0.1:$port/f.bin", out, stableKey = key))
+        val id1 = c1.submit(DownloadRequest("http://127.0.0.1:$port/f.bin", out, stableKey = key))
         kotlinx.coroutines.delay(500)   // 让它下到一半（此时多半已有托管发生的重叠分片）
         c1.shutdown()
+        // 【必须等 c1 的 worker 真正退出】shutdown 只是**发起**取消：在飞的阻塞
+        // 网络调用要等返回后才检查取消标记，worker 会多活一小段时间。不等就启动
+        // 下一个实例，两个引擎会同时写同一个 stableKey 的分片目录 ——
+        // 全量测试跑（CPU 紧张）时这个残留窗口被拉长，相互踩踏后续传报
+        // 「缺失区间」（实测复现两次）。真实宿主对同一任务只会有一个引擎实例
+        // 在写，不存在这种双写；这里是测试自己的时序缺陷，与产品代码无关。
+        // await 挂起到任务终结（此处为取消）；带超时防极端情况下永远挂死。
+        runCatching { kotlinx.coroutines.withTimeout(15_000) { c1.await(id1) } }
 
         val afterFirst = dumpParts(work)
 
